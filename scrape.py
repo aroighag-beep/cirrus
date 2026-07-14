@@ -28,29 +28,62 @@ BASE_URL = (
 TOTAL_PAGES = 3
 DATA_FILE   = "cirrus_data.json"
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-GB,en;q=0.9",
-    "Connection": "keep-alive",
-}
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+]
 
 
-def fetch_page(url: str, retries: int = 3) -> str:
+def make_session() -> requests.Session:
+    session = requests.Session()
+    # Visit homepage first to collect cookies like a real browser
+    try:
+        session.get(
+            "https://www.controlleremea.co.uk/",
+            headers={
+                "User-Agent": USER_AGENTS[0],
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-GB,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+            },
+            timeout=15,
+        )
+        print("  Homepage prefetch OK")
+        time.sleep(2)
+    except Exception as e:
+        print(f"  Homepage prefetch failed (non-fatal): {e}")
+    return session
+
+
+def fetch_page(session: requests.Session, url: str, retries: int = 4) -> str:
     for attempt in range(retries):
+        ua = USER_AGENTS[attempt % len(USER_AGENTS)]
+        headers = {
+            "User-Agent": ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-GB,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-User": "?1",
+            "Referer": "https://www.controlleremea.co.uk/listings/for-sale/cirrus/aircraft",
+        }
         try:
-            r = requests.get(url, headers=HEADERS, timeout=30)
-            print(f"  GET {url} -> {r.status_code} ({len(r.text)} bytes)")
+            r = session.get(url, headers=headers, timeout=30)
+            print(f"  Attempt {attempt+1}: HTTP {r.status_code} ({len(r.text)} bytes)")
             if r.status_code == 200:
                 return r.text
-            time.sleep(3)
+            time.sleep(5 + attempt * 3)
         except Exception as e:
             print(f"  Error on attempt {attempt+1}: {e}")
-            time.sleep(3)
+            time.sleep(5)
     return ""
 
 
@@ -61,18 +94,12 @@ def parse_listings(html: str) -> list:
     soup = BeautifulSoup(html, "lxml")
     listings = []
 
-    # Find all listing blocks — each has an h2 with a /listing/for-retail/ link
-    blocks = soup.find_all(lambda tag: tag.find(
-        "h2", recursive=False
-    ) and tag.find("a", href=re.compile(r"/listing/for-retail/")))
-
-    if not blocks:
-        # Broader search
-        blocks = []
-        for h2 in soup.find_all("h2"):
-            link = h2.find("a", href=re.compile(r"/listing/for-retail/"))
-            if link and h2.parent:
-                blocks.append(h2.parent)
+    # Find all listing blocks
+    blocks = []
+    for h2 in soup.find_all("h2"):
+        link = h2.find("a", href=re.compile(r"/listing/for-retail/"))
+        if link and h2.parent:
+            blocks.append(h2.parent)
 
     print(f"  Found {len(blocks)} listing blocks")
 
@@ -88,8 +115,7 @@ def parse_listings(html: str) -> list:
 
         # Registration
         m = re.search(r"Registration\s*#\s*:?\s*([A-Z0-9\-]+(?:\s*\([^)]+\))?)", text, re.I)
-        reg = m.group(1).strip() if m else ""
-        reg = re.sub(r"\s+", " ", reg)
+        reg = re.sub(r"\s+", " ", m.group(1).strip()) if m else ""
 
         # Hours
         m = re.search(r"Total\s*Time\s*:?\s*([\d,.]+)", text, re.I)
@@ -178,16 +204,20 @@ def main():
                 existing[entry["reg"]] = entry
         print(f"Loaded {len(existing)} existing listings from {DATA_FILE}")
 
+    # Single session with cookie prefetch
+    session = make_session()
+
     # Fetch all pages
     all_fetched = []
     for page in range(1, TOTAL_PAGES + 1):
         url = BASE_URL + (f"&page={page}" if page > 1 else "")
         print(f"\nFetching page {page}...")
-        html = fetch_page(url)
+        html = fetch_page(session, url)
         parsed = parse_listings(html)
         print(f"  Parsed {len(parsed)} listings on page {page}")
         all_fetched.extend(parsed)
-        time.sleep(1)
+        if page < TOTAL_PAGES:
+            time.sleep(3)
 
     # Deduplicate by reg
     fetched_by_reg = {}
@@ -202,7 +232,6 @@ def main():
     added = updated = deleted = 0
     result = {}
 
-    # Add/update
     for reg, listing in fetched_by_reg.items():
         if reg not in existing:
             listing["first_seen"]   = now
@@ -219,9 +248,8 @@ def main():
                 result[reg] = listing
                 updated += 1
             else:
-                result[reg] = ex  # keep existing unchanged entry
+                result[reg] = ex
 
-    # Delete sold (in existing but not in fetched)
     for reg in existing:
         if reg not in fetched_by_reg:
             deleted += 1
@@ -230,7 +258,6 @@ def main():
     print(f"\nSummary: +{added} new, ~{updated} updated, -{deleted} removed")
     print(f"Total in store: {len(result)}")
 
-    # Save
     output = list(result.values())
     output.sort(key=lambda x: x.get("price_usd") or 9999999)
     with open(DATA_FILE, "w") as f:
